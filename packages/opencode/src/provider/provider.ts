@@ -1059,6 +1059,26 @@ export namespace Provider {
     return state().then((state) => state.providers)
   }
 
+  function resolvePlaceholders(value: string, provider: string, model: string, apiId: string): string {
+    return value
+      .replace(/\{model\.name\}/g, model)
+      .replace(/\{model\.id\}/g, model)
+      .replace(/\{model\.api\.id\}/g, apiId)
+  }
+
+  function resolveBodyExtras(
+    extras: Record<string, unknown>,
+    modelName: string,
+    providerId: string,
+    modelId: string,
+  ): Record<string, unknown> {
+    const resolved: Record<string, unknown> = {}
+    for (const [key, val] of Object.entries(extras)) {
+      resolved[key] = typeof val === "string" ? resolvePlaceholders(val, providerId, modelName, modelId) : val
+    }
+    return resolved
+  }
+
   async function getSDK(model: Model) {
     try {
       using _ = log.time("getSDK", {
@@ -1124,7 +1144,46 @@ export namespace Provider {
           }
         }
 
-        return fetchFn(input, {
+        // --- pathRewrite ---
+        let patchedInput: any = input
+        const pathRewrite = options["pathRewrite"] as Record<string, string> | undefined
+        if (pathRewrite) {
+          let urlStr = typeof patchedInput === "string" ? patchedInput : patchedInput.toString()
+          for (const [from, to] of Object.entries(pathRewrite)) {
+            urlStr = urlStr.replace(from, to)
+          }
+          patchedInput = urlStr
+        }
+
+        // --- bodyExtras ---
+        const bodyExtras = options["bodyExtras"] as Record<string, unknown> | undefined
+        if (bodyExtras && opts.method === "POST" && opts.body) {
+          try {
+            const body = JSON.parse(opts.body as string)
+            const modelId = body.model ?? ""
+            const resolved = resolveBodyExtras(bodyExtras, modelId, model.providerID, modelId)
+            Object.assign(body, resolved)
+            opts.body = JSON.stringify(body)
+          } catch {}
+        }
+
+        // --- stripUserAgent ---
+        const isNpmProvider = Boolean(options["npm"])
+        const strip = options["stripUserAgent"] === true || (isNpmProvider && options["stripUserAgent"] !== false)
+        if (strip && opts.headers) {
+          if (opts.headers instanceof Headers) {
+            opts.headers.delete("user-agent")
+            opts.headers.delete("User-Agent")
+          } else if (Array.isArray(opts.headers)) {
+            opts.headers = (opts.headers as [string, string][]).filter(([k]) => k.toLowerCase() !== "user-agent")
+          } else {
+            const h = opts.headers as Record<string, string>
+            delete h["user-agent"]
+            delete h["User-Agent"]
+          }
+        }
+
+        return fetchFn(patchedInput, {
           ...opts,
           // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
           timeout: false,

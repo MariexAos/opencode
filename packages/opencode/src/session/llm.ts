@@ -23,6 +23,16 @@ import { Flag } from "@/flag/flag"
 import { PermissionNext } from "@/permission/next"
 import { Auth } from "@/auth"
 
+function formatToolsForSystem(tools: Record<string, Tool>): string | undefined {
+  const items = Object.entries(tools).map(([name, t]) => ({
+    name,
+    description: t.description,
+    inputSchema: t.inputSchema,
+  }))
+  if (items.length === 0) return undefined
+  return `<tools>\n${JSON.stringify(items, null, 2)}\n</tools>`
+}
+
 export namespace LLM {
   const log = Log.create({ service: "llm" })
   export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
@@ -148,6 +158,11 @@ export namespace LLM {
       isCodex || provider.id.includes("github-copilot") ? undefined : ProviderTransform.maxOutputTokens(input.model)
 
     const tools = await resolveTools(input)
+
+    const toolsText = formatToolsForSystem(tools)
+    if (cfg.experimental?.tools_in_system_prompt && toolsText) {
+      system.push(toolsText)
+    }
 
     // LiteLLM and some Anthropic proxies require the tools parameter to be present
     // when message history contains tool calls, even if no tools are being used.

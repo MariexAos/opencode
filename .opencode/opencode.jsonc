@@ -4,10 +4,32 @@
     "opencode": {
       "options": {},
     },
+    // Example private provider config (uncomment and customize as needed):
+    // "my-private": {
+    //   "name": "Private LLM",
+    //   "api": "https://your-internal-api",
+    //   "npm": "@ai-sdk/openai-compatible",
+    //   "options": {
+    //     "pathRewrite": {
+    //       "/v1/chat/completions": "/api/llm/chat"
+    //     },
+    //     "bodyExtras": {
+    //       "appId": "opencode",
+    //       "modelName": "{model.name}"
+    //     }
+    //   },
+    //   "models": {
+    //     "my-model": { "name": "My Private Model" }
+    //   }
+    // }
   },
   "mcp": {},
   "tools": {
     "github-triage": false,
     "github-pr-search": false,
   },
+  // Uncomment to always inject tool definitions into the system prompt (for private providers):
+  // "experimental": {
+  //   "tools_in_system_prompt": "prompt"
+  // }
 }

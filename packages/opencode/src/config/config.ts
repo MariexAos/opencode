@@ -1166,6 +1166,12 @@ export namespace Config {
             .positive()
             .optional()
             .describe("Timeout in milliseconds for model context protocol (MCP) requests"),
+          tools_in_system_prompt: z
+            .boolean()
+            .optional()
+            .describe(
+              "Inject tool definitions into the system prompt (recommended for private providers that lack native tool-calling support).",
+            ),
         })
         .optional(),
     })

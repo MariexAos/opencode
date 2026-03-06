@@ -104,29 +104,10 @@ export namespace ModelsDev {
   }
 
   export async function refresh() {
-    const result = await fetch(`${url()}/api.json`, {
-      headers: {
-        "User-Agent": Installation.USER_AGENT,
-      },
-      signal: AbortSignal.timeout(10 * 1000),
-    }).catch((e) => {
-      log.error("Failed to fetch models.dev", {
-        error: e,
-      })
-    })
-    if (result && result.ok) {
-      await Filesystem.write(filepath, await result.text())
-      ModelsDev.Data.reset()
+    log.info("skip refresh", { reason: "models.dev fetch is disabled" })
+    return {
+      ok: false as const,
+      reason: "models.dev fetch is disabled",
     }
   }
-}
-
-if (!Flag.OPENCODE_DISABLE_MODELS_FETCH && !process.argv.includes("--get-yargs-completions")) {
-  ModelsDev.refresh()
-  setInterval(
-    async () => {
-      await ModelsDev.refresh()
-    },
-    60 * 1000 * 60,
-  ).unref()
 }

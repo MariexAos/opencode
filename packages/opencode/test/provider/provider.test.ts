@@ -1,10 +1,15 @@
-import { test, expect } from "bun:test"
+import { test, expect, describe, beforeAll, afterAll, beforeEach } from "bun:test"
 import path from "path"
 
 import { tmpdir } from "../fixture/fixture"
 import { Instance } from "../../src/project/instance"
 import { Provider } from "../../src/provider/provider"
 import { Env } from "../../src/env"
+import { LLM } from "../../src/session/llm"
+import { ModelsDev } from "../../src/provider/models"
+import { Filesystem } from "../../src/util/filesystem"
+import type { Agent } from "../../src/agent/agent"
+import type { MessageV2 } from "../../src/session/message-v2"
 
 test("provider loaded from env variable", async () => {
   await using tmp = await tmpdir({
@@ -2277,5 +2282,341 @@ test("cloudflare-ai-gateway forwards config metadata options", async () => {
         project: "opencode",
       })
     },
+  })
+})
+
+// --- HTTP interceptor tests (pathRewrite / bodyExtras / stripUserAgent) ---
+
+type Capture = {
+  url: URL
+  headers: Headers
+  body: Record<string, unknown>
+}
+
+const interceptorState = {
+  server: null as ReturnType<typeof Bun.serve> | null,
+  queue: [] as Array<{ path: string; response: Response; resolve: (value: Capture) => void }>,
+}
+
+function deferred<T>() {
+  const result = {} as { promise: Promise<T>; resolve: (value: T) => void }
+  result.promise = new Promise((resolve) => {
+    result.resolve = resolve
+  })
+  return result
+}
+
+function waitInterceptorRequest(pathname: string, response: Response) {
+  const pending = deferred<Capture>()
+  interceptorState.queue.push({ path: pathname, response, resolve: pending.resolve })
+  return pending.promise
+}
+
+beforeAll(() => {
+  interceptorState.server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const next = interceptorState.queue.shift()
+      if (!next) return new Response("unexpected request", { status: 500 })
+      const url = new URL(req.url)
+      const body = (await req.json().catch(() => ({}))) as Record<string, unknown>
+      next.resolve({ url, headers: req.headers, body })
+      return next.response
+    },
+  })
+})
+
+beforeEach(() => {
+  interceptorState.queue.length = 0
+})
+
+afterAll(() => {
+  interceptorState.server?.stop()
+})
+
+function createChatStreamResponse(text: string) {
+  const payload =
+    [
+      `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", choices: [{ delta: { role: "assistant" } }] })}`,
+      `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", choices: [{ delta: { content: text } }] })}`,
+      `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", choices: [{ delta: {}, finish_reason: "stop" }] })}`,
+      "data: [DONE]",
+    ].join("\n\n") + "\n\n"
+  return new Response(new TextEncoder().encode(payload), {
+    status: 200,
+    headers: { "Content-Type": "text/event-stream" },
+  })
+}
+
+async function loadProviderFixture(providerID: string, modelID: string) {
+  const fixturePath = path.join(import.meta.dir, "../tool/fixtures/models-api.json")
+  const data = await Filesystem.readJson<Record<string, ModelsDev.Provider>>(fixturePath)
+  const provider = data[providerID]
+  if (!provider) throw new Error(`Missing provider in fixture: ${providerID}`)
+  const model = provider.models[modelID]
+  if (!model) throw new Error(`Missing model in fixture: ${modelID}`)
+  return { provider, model }
+}
+
+function makeStreamInput(
+  server: ReturnType<typeof Bun.serve>,
+  providerID: string,
+  resolved: Provider.Model,
+  extraOptions?: Record<string, unknown>,
+): Parameters<typeof LLM.stream>[0] {
+  const sessionID = "session-interceptor-test"
+  const agent: Agent.Info = {
+    name: "test",
+    mode: "primary",
+    options: {},
+    permission: [{ permission: "*", pattern: "*", action: "allow" }],
+  }
+  const user: MessageV2.User = {
+    id: "user-i",
+    sessionID,
+    role: "user",
+    time: { created: Date.now() },
+    agent: agent.name,
+    model: { providerID, modelID: resolved.id },
+  }
+  return {
+    user,
+    sessionID,
+    model: resolved,
+    agent,
+    system: ["You are a test assistant."],
+    abort: new AbortController().signal,
+    messages: [{ role: "user", content: "Hi" }],
+    tools: {},
+  }
+}
+
+describe("provider fetch interceptor", () => {
+  test("pathRewrite rewrites request URL path", async () => {
+    const server = interceptorState.server!
+    const providerID = "privatemode-ai"
+    const modelID = "gpt-oss-120b"
+    const fixture = await loadProviderFixture(providerID, modelID)
+
+    const request = waitInterceptorRequest("/api/llm/chat", createChatStreamResponse("ok"))
+
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await Bun.write(
+          path.join(dir, "opencode.json"),
+          JSON.stringify({
+            $schema: "https://opencode.ai/config.json",
+            enabled_providers: [providerID],
+            provider: {
+              [providerID]: {
+                options: {
+                  apiKey: "test-key",
+                  baseURL: `${server.url.origin}/v1`,
+                  pathRewrite: {
+                    "/v1/chat/completions": "/api/llm/chat",
+                  },
+                },
+              },
+            },
+          }),
+        )
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const resolved = await Provider.getModel(providerID, modelID)
+        const stream = await LLM.stream(makeStreamInput(server, providerID, resolved))
+        for await (const _ of stream.fullStream) {
+        }
+        const capture = await request
+        expect(capture.url.pathname).toBe("/api/llm/chat")
+      },
+    })
+  })
+
+  test("bodyExtras injects extra fields into POST body", async () => {
+    const server = interceptorState.server!
+    const providerID = "privatemode-ai"
+    const modelID = "gpt-oss-120b"
+    await loadProviderFixture(providerID, modelID)
+
+    const request = waitInterceptorRequest("/chat/completions", createChatStreamResponse("ok"))
+
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await Bun.write(
+          path.join(dir, "opencode.json"),
+          JSON.stringify({
+            $schema: "https://opencode.ai/config.json",
+            enabled_providers: [providerID],
+            provider: {
+              [providerID]: {
+                options: {
+                  apiKey: "test-key",
+                  baseURL: `${server.url.origin}/v1`,
+                  bodyExtras: {
+                    appId: "opencode",
+                    modelAlias: "{model.name}",
+                  },
+                },
+              },
+            },
+          }),
+        )
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const resolved = await Provider.getModel(providerID, modelID)
+        const stream = await LLM.stream(makeStreamInput(server, providerID, resolved))
+        for await (const _ of stream.fullStream) {
+        }
+        const capture = await request
+        expect(capture.body.appId).toBe("opencode")
+        // {model.name} placeholder is resolved to the model ID from the request body
+        expect(typeof capture.body.modelAlias).toBe("string")
+        expect((capture.body.modelAlias as string).length).toBeGreaterThan(0)
+      },
+    })
+  })
+
+  test("stripUserAgent: true removes the AI SDK user-agent from request headers", async () => {
+    const server = interceptorState.server!
+    const providerID = "privatemode-ai"
+    const modelID = "gpt-oss-120b"
+    await loadProviderFixture(providerID, modelID)
+
+    const request = waitInterceptorRequest("/chat/completions", createChatStreamResponse("ok"))
+
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await Bun.write(
+          path.join(dir, "opencode.json"),
+          JSON.stringify({
+            $schema: "https://opencode.ai/config.json",
+            enabled_providers: [providerID],
+            provider: {
+              [providerID]: {
+                options: {
+                  apiKey: "test-key",
+                  baseURL: `${server.url.origin}/v1`,
+                  stripUserAgent: true,
+                },
+              },
+            },
+          }),
+        )
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const resolved = await Provider.getModel(providerID, modelID)
+        const stream = await LLM.stream(makeStreamInput(server, providerID, resolved))
+        for await (const _ of stream.fullStream) {
+        }
+        const capture = await request
+        // The AI SDK's identifying UA should be stripped (may still have Bun's runtime UA)
+        const ua = capture.headers.get("user-agent") ?? ""
+        expect(ua).not.toContain("opencode/")
+        expect(ua).not.toContain("ai-sdk/")
+      },
+    })
+  })
+
+  test("npm provider (npm in options) auto-enables stripUserAgent", async () => {
+    const server = interceptorState.server!
+    const providerID = "privatemode-ai"
+    const modelID = "gpt-oss-120b"
+    await loadProviderFixture(providerID, modelID)
+
+    const request = waitInterceptorRequest("/chat/completions", createChatStreamResponse("ok"))
+
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await Bun.write(
+          path.join(dir, "opencode.json"),
+          JSON.stringify({
+            $schema: "https://opencode.ai/config.json",
+            enabled_providers: [providerID],
+            provider: {
+              [providerID]: {
+                options: {
+                  apiKey: "test-key",
+                  baseURL: `${server.url.origin}/v1`,
+                  // Setting npm in options activates isNpmProvider auto-detection
+                  npm: "@ai-sdk/openai-compatible",
+                },
+              },
+            },
+          }),
+        )
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const resolved = await Provider.getModel(providerID, modelID)
+        const stream = await LLM.stream(makeStreamInput(server, providerID, resolved))
+        for await (const _ of stream.fullStream) {
+        }
+        const capture = await request
+        // npm provider should auto-strip identifying user-agent headers
+        const ua = capture.headers.get("user-agent") ?? ""
+        expect(ua).not.toContain("opencode/")
+        expect(ua).not.toContain("ai-sdk/")
+      },
+    })
+  })
+
+  test("npm provider with explicit stripUserAgent: false keeps the AI SDK user-agent", async () => {
+    const server = interceptorState.server!
+    const providerID = "privatemode-ai"
+    const modelID = "gpt-oss-120b"
+    await loadProviderFixture(providerID, modelID)
+
+    const request = waitInterceptorRequest("/chat/completions", createChatStreamResponse("ok"))
+
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await Bun.write(
+          path.join(dir, "opencode.json"),
+          JSON.stringify({
+            $schema: "https://opencode.ai/config.json",
+            enabled_providers: [providerID],
+            provider: {
+              [providerID]: {
+                options: {
+                  apiKey: "test-key",
+                  baseURL: `${server.url.origin}/v1`,
+                  npm: "@ai-sdk/openai-compatible",
+                  stripUserAgent: false,
+                },
+              },
+            },
+          }),
+        )
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const resolved = await Provider.getModel(providerID, modelID)
+        const stream = await LLM.stream(makeStreamInput(server, providerID, resolved))
+        for await (const _ of stream.fullStream) {
+        }
+        const capture = await request
+        // explicit false: AI SDK's user-agent should be present
+        const ua = capture.headers.get("user-agent") ?? ""
+        expect(ua).toContain("opencode/")
+      },
+    })
   })
 })
