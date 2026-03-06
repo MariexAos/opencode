@@ -5,10 +5,10 @@ describe("ModelsDev.refresh", () => {
   test("does not fetch from network and returns ok: false", async () => {
     const fetchCalls: string[] = []
     const originalFetch = global.fetch
-    global.fetch = async (input: RequestInfo | URL) => {
+    global.fetch = (async (input: RequestInfo | URL) => {
       fetchCalls.push(typeof input === "string" ? input : input.toString())
       return originalFetch(input as any)
-    }
+    }) as typeof fetch
 
     try {
       const result = await ModelsDev.refresh()
@@ -31,10 +31,10 @@ describe("ModelsDev.get", () => {
   test("does not fetch from network when snapshot or cache provides data", async () => {
     const fetchCalls: string[] = []
     const originalFetch = global.fetch
-    global.fetch = async (input: RequestInfo | URL) => {
+    global.fetch = (async (input: RequestInfo | URL) => {
       fetchCalls.push(typeof input === "string" ? input : input.toString())
       return originalFetch(input as any)
-    }
+    }) as typeof fetch
 
     try {
       await ModelsDev.get()
